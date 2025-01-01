@@ -2,41 +2,97 @@
 extern crate ffmpeg_next as ffmpeg;
 extern crate sdl2;
 
-
-use std::collections::HashMap;
+ 
+use std::{collections::HashMap, io::Write};
 use std::env;
  
 
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ffmpeg::{
-    codec::{self, traits::Decoder}, decoder::{self, new}, encoder, format, frame::{self, Audio, Video}, log, media, picture, Dictionary, Packet, Rational,
+    codec::{self}, decoder::{self, new}, encoder, format, frame::{self, Audio, Video}, log, media, picture, Dictionary, Packet, Rational,
 };
 
 use ffmpeg_next::software::scaling::{context::Context as ScaleContext, flag::Flags};
-
+use ffmpeg_next::format::Sample as FFmpegSample;
+use ffmpeg_next::format::sample::Type as SampleType;
 use ffmpeg_next:: codec::  Context as CodecContext;
 use ffmpeg_next::util::format::pixel::Pixel;
+
 
 use sdl2::video::{Window, WindowContext};
 use sdl2::render::Canvas;
 use sdl2::pixels::Color;
-use sdl2::audio::{AudioCallback, AudioDevice, AudioSpec, AudioSpecDesired, AudioQueue};
-
+use sdl2::audio::{self,AudioCallback, AudioDevice, AudioSpecWAV,AudioSpec, AudioSpecDesired, AudioQueue};
+use sdl2::AudioSubsystem;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
+use sdl2::audio::{AudioCVT,AudioFormat};
 extern crate byteorder;
-use byteorder::{LittleEndian, ReadBytesExt};
+use byteorder::{LittleEndian, ReadBytesExt,WriteBytesExt};
+use std::io::BufReader;
 use std::io::Cursor;
-fn convert_u8_to_i16(data: &[u8]) -> Vec<i16> {
-    let mut cursor = Cursor::new(data);
-    let mut result = Vec::new();
-    
-    // 每个音频样本为 2 字节 (16 位)
-    while let Ok(sample) = cursor.read_i16::<LittleEndian>() {
-        result.push(sample);
-    }
-    
-    result
+extern crate cpal;
+use ffmpeg_next::software::resampling::{context::Context as ResamplingContext};
+use cpal::{Sample, SampleFormat};
+use ringbuf::traits::ring_buffer::RingBuffer;
+
+use once_mut::once_mut;
+use ringbuf::{traits::*, StaticRb, HeapRb};
+use ringbuf::wrap::caching::CachingCons;
+use ring_buffer::*;
+ 
+trait SampleFormatConversion {
+    fn as_ffmpeg_sample(&self) -> FFmpegSample;
 }
+
+impl SampleFormatConversion for SampleFormat {
+    fn as_ffmpeg_sample(&self) -> FFmpegSample {
+        match self {
+            Self::I16 => FFmpegSample::I16(SampleType::Packed),
+            Self::U16 => {
+                panic!("ffmpeg resampler doesn't support u16")
+            }, 
+            Self::F32 => FFmpegSample::F32(SampleType::Packed),
+            _  =>FFmpegSample::F32(SampleType::Packed),
+
+        }
+    }
+}
+ 
+
+fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
+    let device = cpal::default_host()
+        .default_output_device()
+        .expect("no output device available");
+
+    // Create an output stream for the audio so we can play it
+    // NOTE: If system doesn't support the file's sample rate, the program will panic when we try to play,
+    //       so we'll need to resample the audio to a supported config
+    let supported_config_range = device.supported_output_configs()
+        .expect("error querying audio output configs")
+        .next()
+        .expect("no supported audio config found");
+
+    // Pick the best (highest) sample rate
+    (device, supported_config_range.with_max_sample_rate())
+}
+
+// Interpret the audio frame's data as packed (alternating channels, 12121212, as opposed to planar 11112222)
+pub fn packed<T: frame::audio::Sample>(frame: &frame::Audio) -> &[T] {
+    if !frame.is_packed() {
+        panic!("data is not packed");
+    }
+
+    if !<T as frame::audio::Sample>::is_valid(frame.format(), frame.channels()) {
+        panic!("unsupported type");
+    }
+
+    unsafe { std::slice::from_raw_parts((*frame.as_ptr()).data[0] as *const T, frame.samples() * frame.channels() as usize) }
+}
+fn err_fn(err: cpal::StreamError) {
+    eprintln!("an error occurred on stream: {}", err);
+}
+
 fn main() {
     let input_file = env::args().nth(1).expect("missing input file");
     // let output_file = env::args().nth(2).expect("missing output file");
@@ -76,7 +132,7 @@ fn main() {
     // 初始化 SDL2
     let sdl_context = sdl2::init().unwrap();
     let video_subsystem = sdl_context.video().unwrap();
-    let audio_subsystem = sdl_context.audio().unwrap();
+    // let audio_subsystem = sdl_context.audio().unwrap();
 
 
     // 创建 SDL2 窗口和画布
@@ -95,24 +151,99 @@ fn main() {
     let mut i = 0;
 
 
-    // 设置音频播放
-    let desired_spec = AudioSpecDesired {
-        freq: Some(44_100),
-        channels: Some(2),
-        samples: Some(4096),
-    };
-
+    
      
 
     // Open an audio device
-    let device  = audio_subsystem
-        .open_queue::<i16, _>(None, &desired_spec)
-        .unwrap();
+    // let device  = audio_subsystem
+    //     .open_queue::<i16, _>(None, &desired_spec)
+    //     .unwrap();
+    // 创建音频播放器
+    // let audio_spec_actual = audio_subsystem
+    //     .open_playback(None, &desired_spec,|spec|{
+    //         AudioPlayer::new( );
+    //     }).expect("msg");
+
+    // Initialize cpal for playing audio
+    // Conditionally compile with jack if the feature is specified.
+    #[cfg(all(
+        any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ),
+        feature = "jack"
+    ))]
+    // Manually check for flags. Can be passed through cargo with -- e.g.
+    // cargo run --release --example beep --features jack -- --jack
+    let host = if opt.jack {
+        cpal::host_from_id(cpal::available_hosts()
+            .into_iter()
+            .find(|id| *id == cpal::HostId::Jack)
+            .expect(
+                "make sure --features jack is specified. only works on OSes where jack is available",
+            )).expect("jack host unavailable")
+    } else {
+        cpal::default_host()
+    };
+
+    #[cfg(any(
+        not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        )),
+        not(feature = "jack")
+    ))]
+    let host = cpal::default_host();    
+    let output_device = host.default_output_device();
 
 
-    // let device = audio_subsystem.open_playback(None, &desired_spec, get_callback).unwrap();
 
+    let (device, stream_config) = init_cpal();
+    println!("audio_decoder.format(){:?}",audio_decoder.format());
+    println!("stream_config.sample_format(){:?}",stream_config.sample_format());
+    // Set up a resampler for the audio
+    let mut resampler = ResamplingContext::get(
+        audio_decoder.format(),
+        audio_decoder.channel_layout(),
+        audio_decoder.rate(),
+        
+        stream_config.sample_format().as_ffmpeg_sample(),
+        audio_decoder.channel_layout(),
+        stream_config.sample_rate().0
+    ).unwrap();
 
+    // A buffer to hold audio samples
+    let buf = HeapRb::<f32>::new(8192);
+    let (mut producer, mut consumer) = buf.split();
+    let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+        let mut input_fell_behind = false;
+        for sample in data {
+            *sample = match consumer.try_pop() {
+                Some(s) => s,
+                None => {
+                    input_fell_behind = true;
+                    0.0
+                }
+            };
+        }
+        if input_fell_behind {
+            eprintln!("input stream fell behind: try increasing latency");
+        }
+    }; 
+
+     
+    // let d =  device.build_output_stream(&stream_config.into(),output_data_fn,  err_fn,None).unwrap();
+    // Set up the audio output stream
+    let audio_stream = match stream_config.sample_format() {
+        SampleFormat::F32 => device.build_output_stream(&stream_config.into(),output_data_fn,  err_fn,None),
+        SampleFormat::I16 => panic!("i16 output format unimplemented"),
+        SampleFormat::U16 => panic!("u16 output format unimplemented"),
+        _=> device.build_output_stream(&stream_config.into(),output_data_fn,  err_fn,None),
+    }.unwrap();
 
     // 获取视频帧的缩放上下文
     let mut scaler = ScaleContext::get(
@@ -125,25 +256,23 @@ fn main() {
         Flags::BILINEAR,
     ).unwrap();
     
-
-    //加载视频信息
-  
+     //加载视频信息
+    
     // 播放音视频
-    let mut packet = Packet::empty();
-    let mut last_video_pts = 0.0;
-    let mut last_audio_pts = 0.0;
-     
-     
-    let mut flag = true;
-    device.resume();
+    audio_stream.play().unwrap();
+    let mut fram_index = 0;
+    let mut audio_frame = Audio::empty();
+    let mut ist_index =0;
+    let mut video_decoded_frame = Video::empty();
+    // device.resume();
     let mut i_iter = ictx.packets();
     'main_loop: loop{
         let (stream,mut packet) = i_iter.next().expect("遍历文件失败"); 
         // 读取视频帧
-        let ist_index = stream.index();
+        ist_index = stream.index();
         if packet.stream() == video_stream_index {
             video_decoder.send_packet(&packet).expect("解码视频失败");
-            let mut video_decoded_frame = Video::empty();
+            
             if video_decoder.receive_frame(&mut video_decoded_frame).is_ok() {
                 // 对视频帧进行缩放
                 let mut rgb_frame = Video::empty();
@@ -160,18 +289,28 @@ fn main() {
                 texture.update(None, &rgb_frame.data(ist_index), rgb_frame.stride(ist_index) as usize).unwrap();
                 canvas.copy(&texture, None, None).unwrap();
                 canvas.present();
-                last_video_pts = video_decoded_frame.timestamp().unwrap() as f64 / video_decoded_frame.aspect_ratio().denominator() as f64;
-            }
+             }
         } else if packet.stream() == audio_stream_index {
             packet.rescale_ts(stream.time_base(), audio_decoder.time_base());
             audio_decoder.send_packet(&packet).expect("解码音频失败");
-            let mut audio_frame = Audio::empty();
+           
             if audio_decoder.receive_frame(&mut audio_frame).is_ok() {
-                let timestamp = audio_frame.timestamp();
-                // 播放音频
-                audio_frame.set_pts(timestamp);
-                device.queue_audio(convert_u8_to_i16(&audio_frame.data(0)).as_slice() ).expect("加载音频失败");
-                last_audio_pts = audio_frame.timestamp().unwrap() as f64 / audio_frame.rate()  as f64;
+                // Resample the frame's audio into another frame
+                let mut resampled = frame::Audio::empty();
+                resampler.run(&audio_frame, &mut resampled).unwrap();
+
+                // DON'T just use resampled.data(0).len() -- it might not be fully populated
+                // Grab the right number of bytes based on sample count, bytes per sample, and number of channels.
+                let both_channels = packed(&resampled);
+
+                // Sleep until the buffer has enough space for all of the samples
+                // (the producer will happily accept a partial write, which we don't want)
+                while producer.capacity().get()< both_channels.len() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+
+                // Buffer the samples for playback
+                producer.push_slice(both_channels); 
             }
          }  
         // 控制播放同步
@@ -191,7 +330,12 @@ fn main() {
          
     
     }
+    // 播放音频
 
+    
+    
 
      
 }
+
+ 
