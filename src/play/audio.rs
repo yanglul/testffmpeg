@@ -135,7 +135,7 @@ trait FFMpegToCPalSampleForwarder {
     ) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 }
 
-impl<T: Pod, R: RbRef> FFMpegToCPalSampleForwarder for Caching<R, const P: bool, const C: bool>  
+impl<T: Pod, R: RbRef> FFMpegToCPalSampleForwarder for Caching<R, bool, bool>  
 where
     <R as RbRef>::Rb: RbRef<T>,
 {

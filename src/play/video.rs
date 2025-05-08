@@ -2,8 +2,11 @@ use crate::player::ControlCommand;
 
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
-
+use sdl2::render::Canvas;
+use sdl2::video::Window;
 use futures::{future::OptionFuture, FutureExt};
+
+
 
 
 pub struct VideoPlaybackThread {
@@ -23,7 +26,6 @@ impl VideoPlaybackThread {
 
         let decoder_context = ffmpeg_next::codec::Context::from_parameters(stream.parameters())?;
         let mut packet_decoder = decoder_context.decoder().video()?;
-
         let clock = StreamClock::new(stream);
 
         let receiver_thread =
@@ -34,7 +36,7 @@ impl VideoPlaybackThread {
                             let Ok(packet) = packet_receiver.recv().await else { break };
 
                             smol::future::yield_now().await;
-
+                            
                             packet_decoder.send_packet(&packet).unwrap();
 
                             let mut decoded_frame = ffmpeg_next::util::frame::Video::empty();
