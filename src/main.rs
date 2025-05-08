@@ -1,15 +1,9 @@
 
 extern crate ffmpeg_next as ffmpeg;
 extern crate sdl2;
-
- 
-use std::{collections::HashMap, io::Write};
 use std::env;
- 
-
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ffmpeg::{
-    codec::{self}, decoder::{self, new}, encoder, format, frame::{self, Audio, Video}, log, media, picture, Dictionary, Packet, Rational,
+use ffmpeg::{decoder::{new}, format, frame::{self, Audio, Video}, log, media
 };
 
 use ffmpeg_next::software::scaling::{context::Context as ScaleContext, flag::Flags};
@@ -18,28 +12,17 @@ use ffmpeg_next::format::sample::Type as SampleType;
 use ffmpeg_next:: codec::  Context as CodecContext;
 use ffmpeg_next::util::format::pixel::Pixel;
 
+mod play;
+mod player;
 
-use sdl2::video::{Window, WindowContext};
-use sdl2::render::Canvas;
+use sdl2::video::{Window};
 use sdl2::pixels::Color;
-use sdl2::audio::{self,AudioCallback, AudioDevice, AudioSpecWAV,AudioSpec, AudioSpecDesired, AudioQueue};
-use sdl2::AudioSubsystem;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use sdl2::audio::{AudioCVT,AudioFormat};
+use std::time::{ Instant};
 extern crate byteorder;
-use byteorder::{LittleEndian, ReadBytesExt,WriteBytesExt};
-use std::io::BufReader;
-use std::io::Cursor;
 extern crate cpal;
 use ffmpeg_next::software::resampling::{context::Context as ResamplingContext};
-use cpal::{Sample, SampleFormat};
-use ringbuf::traits::ring_buffer::RingBuffer;
-
-use once_mut::once_mut;
-use ringbuf::{traits::*, StaticRb, HeapRb};
-use ringbuf::wrap::caching::CachingCons;
-use ring_buffer::*;
+use cpal::{ SampleFormat};
+use ringbuf::{traits::*,HeapRb};
  
 trait SampleFormatConversion {
     fn as_ffmpeg_sample(&self) -> FFmpegSample;
@@ -95,7 +78,6 @@ fn err_fn(err: cpal::StreamError) {
 
 fn main() {
     let input_file = env::args().nth(1).expect("missing input file");
-    // let output_file = env::args().nth(2).expect("missing output file");
    
     ffmpeg::init().unwrap();
     log::set_level(log::Level::Info);
@@ -217,7 +199,7 @@ fn main() {
     ).unwrap();
 
     // A buffer to hold audio samples
-    let buf = HeapRb::<f32>::new(8192);
+    let buf = HeapRb::<f32>::new(88200);
     let (mut producer, mut consumer) = buf.split();
     let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
         let mut input_fell_behind = false;
@@ -231,7 +213,7 @@ fn main() {
             };
         }
         if input_fell_behind {
-            eprintln!("input stream fell behind: try increasing latency");
+            //填充空白音频todo
         }
     }; 
 
@@ -272,7 +254,6 @@ fn main() {
         ist_index = stream.index();
         if packet.stream() == video_stream_index {
             video_decoder.send_packet(&packet).expect("解码视频失败");
-            
             if video_decoder.receive_frame(&mut video_decoded_frame).is_ok() {
                 // 对视频帧进行缩放
                 let mut rgb_frame = Video::empty();
@@ -293,7 +274,6 @@ fn main() {
         } else if packet.stream() == audio_stream_index {
             packet.rescale_ts(stream.time_base(), audio_decoder.time_base());
             audio_decoder.send_packet(&packet).expect("解码音频失败");
-           
             if audio_decoder.receive_frame(&mut audio_frame).is_ok() {
                 // Resample the frame's audio into another frame
                 let mut resampled = frame::Audio::empty();
@@ -305,37 +285,17 @@ fn main() {
 
                 // Sleep until the buffer has enough space for all of the samples
                 // (the producer will happily accept a partial write, which we don't want)
-                while producer.capacity().get()< both_channels.len() {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-
+                // while producer.capacity().get()< both_channels.len() {
+                //     std::thread::sleep(std::time::Duration::from_millis(10));
+                // }
                 // Buffer the samples for playback
                 producer.push_slice(both_channels); 
             }
          }  
         // 控制播放同步
         let now = Instant::now();
-        // if last_video_pts > last_audio_pts {
-        //     // 等待视频同步
-        //     while now.elapsed() < Duration::from_secs_f64(last_video_pts - last_audio_pts) {
-        //         std::thread::sleep(Duration::from_millis(10));
-        //     }
-        // } else if last_audio_pts > last_video_pts {
-        //     // 等待音频同步
-        //     while now.elapsed() < Duration::from_secs_f64(last_audio_pts - last_video_pts) {
-        //         std::thread::sleep(Duration::from_millis(10));
-        //     }
-        // }
-
-         
-    
     }
     // 播放音频
-
-    
-    
-
-     
 }
 
  
