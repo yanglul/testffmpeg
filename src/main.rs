@@ -10,6 +10,7 @@ use ffmpeg_next::format::Sample as FFmpegSample;
 use ffmpeg_next::format::sample::Type as SampleType;
 use ffmpeg_next:: codec::  Context as CodecContext;
 use ffmpeg_next::util::format::pixel::Pixel;
+use play::audio;
 
 mod play;
 mod player;
@@ -22,6 +23,10 @@ extern crate cpal;
 use ffmpeg_next::software::resampling::{context::Context as ResamplingContext};
 use cpal::{ SampleFormat};
 use ringbuf::{traits::*,HeapRb};
+use std::time::Duration;
+use ffmpeg_next::util::format::sample;
+use cpal::SizedSample;
+use bytemuck::Pod;
 
 fn main() {
     let input_file = env::args().nth(1).expect("missing input file");
@@ -91,13 +96,82 @@ fn main() {
         video_decoder.height(),
         Flags::BILINEAR,
     ).unwrap(); 
+    // 启动解码线程
+    
+    let (device, stream_config,sample) = init_cpal();
+    println!("audio_decoder.format(){:?}",audio_decoder.format());
+    println!("stream_config.sample_format(){:?}",stream_config.sample_format());
+
+    // A buffer to hold audio samples
+    let buf = HeapRb::<f32>::new(88200);
+    let (mut producer, mut consumer) = buf.split();
+    
+
+    // Set up a resampler for the audio
+    let mut resampler = ResamplingContext::get(
+        audio_decoder.format(),
+        audio_decoder.channel_layout(),
+        audio_decoder.rate(),
+        
+        sample,
+        audio_decoder.channel_layout(),
+        stream_config.sample_rate().0
+    ).unwrap();
+
+    audio::audio_play(stream_config, &device, consumer);
+
+
+
+    tokio::spawn(async move {
+        player::Player::start(ictx,audio_packet_sender,video_packet_sender,video_stream_index,audio_stream_index,video_decoder,audio_decoder);
+    });
+    loop{
+
+        match audio_packet_receiver.try_recv(){
+            Ok((apacket,ist_index))=>{
+                let expected_bytes =
+                apacket.samples() * apacket.channels() as usize * core::mem::size_of::<T>();
+                let cpal_sample_data: &[T] =
+                    bytemuck::cast_slice(&audio_frame.data(0)[..expected_bytes]);
+                
+                },
+            _=>{}
+        }
+
+
+        match video_packet_receiver.try_recv(){
+            Ok((vpacket,ist_index))=>{
+                // 对视频帧进行缩放
+                let mut rgb_frame = Video::empty();
+                scaler.run(&vpacket, &mut rgb_frame).unwrap();
+
+                // 渲染到 SDL2 画布
+                canvas.clear();
+                let texture_creator = canvas.texture_creator();
+                let mut texture = texture_creator.create_texture_target(
+                    sdl2::pixels::PixelFormatEnum::RGB24,
+                    rgb_frame.width() as u32,
+                    rgb_frame.height() as u32,
+                ).unwrap();
+                texture.update(None, &rgb_frame.data(ist_index), rgb_frame.stride(ist_index) as usize).unwrap();
+                canvas.copy(&texture, None, None).unwrap();
+                canvas.present();
+                thread::sleep(Duration::from_millis(16));
+            },
+            _=>{}
+        }
+
+    }
+
+
+
 
  
 
     
 }
 
-fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
+fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig,ffmpeg_next::util::format::sample::Sample) {
     let device = cpal::default_host()
         .default_output_device()
         .expect("no output device available");
@@ -109,7 +183,23 @@ fn init_cpal() -> (cpal::Device, cpal::SupportedStreamConfig) {
         .expect("error querying audio output configs")
         .next()
         .expect("no supported audio config found");
+    let config  = supported_config_range.with_max_sample_rate();
+    let output_channel_layout = match config.channels() {
+            1 => ffmpeg_next::util::channel_layout::ChannelLayout::MONO,
+            2 => ffmpeg_next::util::channel_layout::ChannelLayout::STEREO,
+            _ => todo!(),
+        };
+
+    let sample = match config.sample_format() {
+            cpal::SampleFormat::U8 => ffmpeg_next::util::format::sample::Sample::U8(
+                ffmpeg_next::util::format::sample::Type::Packed,
+            ),
+            cpal::SampleFormat::F32 => ffmpeg_next::util::format::sample::Sample::F32(
+                ffmpeg_next::util::format::sample::Type::Packed,
+            ),
+            format @ _ => todo!("unsupported cpal output format {:#?}", format),
+        };
 
     // Pick the best (highest) sample rate
-    (device, supported_config_range.with_max_sample_rate())
+    (device,config ,sample)
 }
