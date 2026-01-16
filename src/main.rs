@@ -1,178 +1,151 @@
-use crossbeam_channel::{Receiver, Sender, bounded, select, tick};
+use eframe::{egui,};
+use ffmpeg_next as ffmpeg;
+use std::sync::{Arc, Mutex,mpsc};
+use std::thread;
 use ffmpeg_next::codec::Context as CodecContext;
-use ffmpeg_next::decoder::new;
-use ffmpeg_next::format::Pixel;
-use ffmpeg_next::format::{Context, input};
-use ffmpeg_next::frame::Video;
-use ffmpeg_next::software::scaling::Context as scaling_context;
-use sdl2::pixels::Color;
-use sdl2::video::Window;
-use std::time::{Duration, Instant};
-use std::{
-    fmt::Debug,
-    sync::{Arc, Mutex,RwLock, mpsc},
-    thread,
-};
+struct FFMpegPlayer {
+    texture_handle: Option<egui::TextureHandle>,
+    is_playing: bool,
+    receiver: mpsc::Receiver<VideoData>,
+    sender: mpsc::Sender<VideoData>,
+}
 
-fn main() {
-    // let _ = audio::play_mp4(file);
-    ffmpeg_next::init().unwrap();
+struct VideoData {
+    width: u32,
+    height: u32,
+    frame: Vec<u8>,
+}
 
-    // 初始化 SDL2
-    let sdl_context = sdl2::init().unwrap();
-    let video_subsystem = sdl_context.video().unwrap();
-
-    let width = 640;
-    let height = 480;
-
-    // 创建 SDL2 窗口和画布
-    let window = video_subsystem
-        .window("FFmpeg + SDL2 Video Player", width, height)
-        .position_centered()
-        .build()
-        .unwrap();
-    let mut canvas = window.into_canvas().build().unwrap();
-    canvas.set_draw_color(Color::BLACK);
-    canvas.clear();
-    canvas.present();
-
-    let shared_vec = Arc::new(RwLock::new(Vec::<Vframe>::new()));
-    let mut current_frame_index = 0;
-    let mut start = Instant::now();
-    let (v_tx, v_rx) = mpsc::channel::<Vframe>();
-    // let (v_tx, v_rx) = mpsc::channel::<Vframe>(65536);
-    // 渲染循环在单独线程
-    let cv = Arc::clone(&shared_vec);
-    let reader_thread = thread::spawn(move || {
-        // 打开输入文件
-        let file = &std::env::args().nth(1).expect("Cannot open file.");
-        let mut ictx = input(&file).unwrap();
-        // 查找视频流
-        let video_stream = ictx
-            .streams()
-            .best(ffmpeg_next::media::Type::Video)
-            .ok_or(anyhow::anyhow!("No video stream found"))
-            .unwrap();
-
-        let audio_stream = ictx
-            .streams()
-            .best(ffmpeg_next::media::Type::Audio)
-            .ok_or(anyhow::anyhow!("No video stream found"))
-            .unwrap();
-
-        let audio_stream_index = audio_stream.index();
-        let video_stream_index = video_stream.index();
-        let duration = ictx.duration(); //总时长
-        println!("duration {}", duration);
-        let context = CodecContext::from_parameters(video_stream.parameters()).unwrap();
-        let total_frams = video_stream.frames();
-        println!("total_frams {}", duration / total_frams);
-        let fduration = duration / total_frams;
-        println!("帧间隔:{}ns", fduration);
-        let mut i_iter = ictx.packets();
-        // 获取解码器上下文
-
-        let mut decoder_context = context.decoder().video().unwrap();
-
-        let width = decoder_context.width();
-        let height = decoder_context.height();
-        // 初始化缩放上下文
-        let mut scaling_context = ffmpeg_next::software::scaling::Context::get(
-            decoder_context.format(),
-            width,
-            height,
-            Pixel::RGB24,
-            width,
-            height,
-            ffmpeg_next::software::scaling::Flags::BILINEAR,
-        )
-        .unwrap();
-        let temp_vec = Arc::clone(&shared_vec);
-        loop {
-            match i_iter.next() {
-                Some((stream, packet)) => {
-                    let ist_index = stream.index();
-                    if packet.stream() == video_stream_index {
-                        // 发送包到解码器
-                        decoder_context.send_packet(&packet).unwrap();
-
-                        // 接收解码后的帧
-                        let mut decoded_frame = Video::empty();
-                        if decoder_context.receive_frame(&mut decoded_frame).is_ok() {
-                            // 缩放帧到RGB格式
-                            let mut rgb_frame = Video::empty();
-                            scaling_context.run(&decoded_frame, &mut rgb_frame).unwrap();
-
-                            // 保存帧数据到缓冲区
-                            let vf = Vframe {
-                                v: rgb_frame,
-                                i: ist_index,
-                            };
-                            println!("添加帧数");
-                            // let mut vec = temp_vec.write().unwrap();
-                            // vec.push(vf);
-                            v_tx.send(vf).unwrap();
-
-                        }
-                    } else if packet.stream() == audio_stream_index {
-                    }
-                }
-                _ => {}
-            }
-  
-        }
-    });
-
-    
-    loop {
-         
-        let curent_frame = v_rx.recv();
-        match curent_frame {
-            Ok(f) => {
-                let rgb_frame = &f.v;
-                let findex = f.i;
-                canvas.clear();
-                let texture_creator = canvas.texture_creator();
-                let mut texture = texture_creator
-                    .create_texture_target(
-                        sdl2::pixels::PixelFormatEnum::RGB24,
-                        rgb_frame.width() as u32,
-                        rgb_frame.height() as u32,
-                    )
-                    .unwrap();
-                texture
-                    .update(
-                        None,
-                        &rgb_frame.data(findex),
-                        rgb_frame.stride(findex) as usize,
-                    )
-                    .unwrap();
-                canvas.copy(&texture, None, None).unwrap();
-                canvas.present();
-                current_frame_index += 1;
-                start = Instant::now();
-                thread::sleep(Duration::from_millis(33));
-            }
-            _ => {
-                println!("暂无视频")
-            }
+impl Default for FFMpegPlayer {
+    fn default() -> Self {
+        ffmpeg::init().unwrap();
+        let (v_tx, v_rx) = mpsc::channel::<VideoData>();
+        Self {
+            texture_handle: None,
+            is_playing: false,
+            receiver:v_rx,
+            sender:v_tx,
         }
     }
 }
 
-struct VideoPlayer {
-    current_frame: Video,
-    is_playing: bool,
-    last_update: Instant,
+impl eframe::App for FFMpegPlayer {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("FFmpeg + EGUI player");
+            
+            if ui.button("loadVideo").clicked() {
+                self.load_video(&"D:\\workspace\\pwork\\decZip\\qyqx.mp4");
+            }
+            
+            // 显示视频
+            if let Some(texture) = &self.texture_handle {
+                ui.image(texture);
+            }
+        });
+        
+        // 更新视频帧
+        // let mut video_data = self.video_data.lock().unwrap();
+        let result_frame_data = self.receiver.try_recv();
+        if self.is_playing && result_frame_data.is_ok() {
+            let mut temp_frame = result_frame_data.unwrap();
+            let frame_data = &temp_frame.frame;
+            
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                [temp_frame.width as usize, temp_frame.height as usize],
+                frame_data,
+            );
+            
+            if self.texture_handle.is_none() {
+                self.texture_handle = Some(ctx.load_texture(
+                    "video",
+                    color_image,
+                    Default::default(),
+                ));
+            } else {
+                self.texture_handle.as_mut().unwrap().set(color_image, Default::default());
+            }
+            
+            ctx.request_repaint();
+        }
+    }
 }
 
-pub enum Vstate {
-    Playing,
-    Pause,
-    Stop,
+impl FFMpegPlayer {
+    fn load_video( &mut self, path: &str) {
+        
+        thread::spawn(move || {
+            if let Ok(mut ictx) = ffmpeg::format::input(&path) {
+                let input = ictx
+                    .streams()
+                    .best(ffmpeg::media::Type::Video)
+                    .ok_or(ffmpeg::Error::StreamNotFound)
+                    .unwrap();
+                
+                let stream_index = input.index();
+                // let mut decoder = input.codec().decoder().video().unwrap();
+                let video_stream = ictx
+                .streams()
+                .best(ffmpeg_next::media::Type::Video)
+                .ok_or(anyhow::anyhow!("No video stream found"))
+                .unwrap();
+                let context = CodecContext::from_parameters(video_stream.parameters()).unwrap();
+                let mut decoder = context.decoder().video().unwrap();
+ 
+                let mut width = 0;
+                let mut height = 0;
+                
+                for (stream, packet) in ictx.packets() {
+                    if stream.index() == stream_index {
+                        match decoder.send_packet(&packet) {
+                            Ok(_) => {
+                                let mut decoded = ffmpeg::frame::Video::empty();
+                                
+                                while decoder.receive_frame(&mut decoded).is_ok() {
+                                    let mut scaler = ffmpeg::software::scaling::Context::get(
+                                        decoded.format(),
+                                        decoded.width(),
+                                        decoded.height(),
+                                        ffmpeg::format::Pixel::RGBA,
+                                        decoded.width(),
+                                        decoded.height(),
+                                        ffmpeg::software::scaling::Flags::BILINEAR,
+                                    ).unwrap();
+                                    
+                                    let mut rgb_frame = ffmpeg::frame::Video::empty();
+                                    scaler.run(&decoded, &mut rgb_frame).unwrap();
+                                    
+                                    width = rgb_frame.width() as u32;
+                                    height = rgb_frame.height() as u32;
+                                    
+                                    // frames.push(rgb_frame.data(0).to_vec());
+                                    let video_data = VideoData {
+                                        width,
+                                        height,
+                                        frame:rgb_frame.data(0).to_vec()
+                                    };
+                                    self.sender.send(video_data).unwrap();
+
+
+                                }
+                            }
+                            Err(e) => eprintln!("解码错误: {}", e),
+                        }
+                    }
+                }
+            
+                
+            }
+        });
+    }
 }
-#[derive(Clone)]
-pub struct Vframe {
-    v: Video,
-    i: usize,
+
+
+fn main() -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions::default();
+    eframe::run_native(
+        "Video Player",
+        options,
+        Box::new(|_cc| Ok(Box::new(FFMpegPlayer::default()))),
+    )
 }
