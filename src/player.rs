@@ -249,7 +249,6 @@ pub trait Streamer: Send {
                     // Don't try to set elasped time off of undefined timestamp values
                     Some(ffmpeg::ffi::AV_NOPTS_VALUE) => (),
                     Some(dts) => {
-                        
                         self.elapsed_ms().set(timestamp_to_millisec(dts, time_base));
                     }
                     _ => (),
@@ -1221,6 +1220,10 @@ impl FFMpegPlayer {
             #[cfg(feature = "from_bytes")]
             temp_file: None,
         };
+        
+        std::thread::spawn(move || {
+             streamer.video_streamer.loadviedo();
+        });
 
         loop {
             if let Ok(_texture_handle) = streamer.try_set_texture_handle() {
