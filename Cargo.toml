@@ -18,7 +18,7 @@ tokio = { version = "1.45.0", features = ["full"] }
 simple_logger = "4.0.0"
 log = "0.4"
 crossterm = "0.29.0"
-eframe = "0.31.1"
+eframe = "0.33.3"
 rfd = "0.15.3"
 atomic = "0.6.0"
 chrono = "0.4.41"
