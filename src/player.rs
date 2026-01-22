@@ -338,8 +338,6 @@ pub struct VideoStreamer {
     video_elapsed_ms: Shared<i64>,
     _audio_elapsed_ms: Shared<i64>,
     apply_video_frame_fn: Option<ApplyVideoFrameFn>,
-    video_receiver: Receiver<Video>,
-    video_sender: Sender<Video>,
 
 }
 use ffmpeg_next::software::scaling::{context::Context as ScaleContext, flag::Flags};
@@ -378,7 +376,8 @@ impl Streamer for VideoStreamer {
         &self.player_state
     }
     fn decode_frame(&mut self) -> Result<Self::Frame> {
-        let decoded_frame = self.video_receiver.recv().unwrap();
+        let mut decoded_frame = Video::empty();
+        self.video_decoder.receive_frame(&mut decoded_frame)?;
         Ok(decoded_frame)
     }
     fn apply_frame(&mut self, frame: Self::ProcessedFrame) {
@@ -563,7 +562,7 @@ impl FFMpegPlayer {
         let mut texture_handle = self.texture_handle.clone();
         let texture_options = self.options.texture_options;
         let ctx = self.ctx_ref.clone();
-        let wait_duration = Duration::milliseconds((1000. / self.framerate) as i64);
+        let wait_duration = Duration::milliseconds((1000. / 60.0) as i64);
         println!("wait_duration:{:?}",wait_duration);
         // let wait_duration = Duration::milliseconds((1000. /60.0) as i64);
         fn play<T: Streamer>(streamer: &Weak<Mutex<T>>) {
@@ -1170,7 +1169,6 @@ impl FFMpegPlayer {
         let size = Vec2::new(width as f32, height as f32);
         let duration_ms = timestamp_to_millisec(input_context.duration(), AV_TIME_BASE_RATIONAL); // in sec
         // let duration_ms = 16;
-        let (video_sender,video_receiver) = channel();
         let stream_decoder = VideoStreamer {
             apply_video_frame_fn: None,
             duration_ms,
@@ -1180,8 +1178,6 @@ impl FFMpegPlayer {
             video_elapsed_ms: video_elapsed_ms.clone(),
             input_context,
             player_state: player_state.clone(),
-            video_sender,
-            video_receiver,
         };
         let options = PlayerOptions::default();
         let texture_handle =
@@ -1221,10 +1217,7 @@ impl FFMpegPlayer {
             temp_file: None,
         };
         
-        std::thread::spawn(move || {
-             streamer.video_streamer.loadviedo();
-        });
-
+         
         loop {
             if let Ok(_texture_handle) = streamer.try_set_texture_handle() {
                 break;
